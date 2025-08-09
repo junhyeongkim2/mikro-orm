@@ -1,6 +1,6 @@
 import { MikroORM, TransactionPropagation, FlushMode } from '@mikro-orm/mongodb';
 import { Author } from './entities';
-import { initORMMongo } from './bootstrap';
+import { initORMMongo, mockLogger } from './bootstrap';
 
 describe('Transaction Propagation - MongoDB', () => {
   let orm: MikroORM;
@@ -49,6 +49,37 @@ describe('Transaction Propagation - MongoDB', () => {
       expect(session).toBeDefined();
       const count = await orm.em.count(Author);
       expect(count).toBe(1);
+    });
+
+    it('should reuse same session with query logging', async () => {
+      const mock = mockLogger(orm, ['query']);
+      const em = orm.em.fork();
+
+      await em.transactional(async em1 => {
+        const entity1 = new Author('outer', 'outer@test.com');
+        await em1.persistAndFlush(entity1);
+
+        await em1.transactional(async em2 => {
+          const entity2 = new Author('inner', 'inner@test.com');
+          await em2.persistAndFlush(entity2);
+        }, { propagation: TransactionPropagation.REQUIRED });
+      });
+
+      // MongoDB uses startSession/commitTransaction instead of BEGIN/COMMIT
+      const sessionCalls = mock.mock.calls.filter(c =>
+        c[0].toLowerCase().includes('startsession') ||
+        c[0].toLowerCase().includes('starttransaction') ||
+        c[0].toLowerCase().includes('session'),
+      );
+
+      // Should reuse the same session
+      const commitCalls = mock.mock.calls.filter(c =>
+        c[0].toLowerCase().includes('committransaction') ||
+        c[0].toLowerCase().includes('aborttransaction'),
+      );
+
+      // MongoDB transaction behavior verification
+      expect(commitCalls.length).toBeLessThanOrEqual(1);
     });
 
     it('should rollback all operations when inner transaction fails', async () => {

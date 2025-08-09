@@ -1,4 +1,5 @@
 import { Entity, MikroORM, PrimaryKey, Property, TransactionPropagation, FlushMode } from '@mikro-orm/sqlite';
+import { mockLogger } from './bootstrap';
 
 @Entity()
 class TestEntity {
@@ -67,6 +68,30 @@ describe('Transaction Propagation - SQLite', () => {
       expect(trx).toBeDefined();
       const count = await orm.em.count(TestEntity);
       expect(count).toBe(1);
+    });
+
+    it('should reuse same database connection and transaction with query logging', async () => {
+      const mock = mockLogger(orm, ['query']);
+      const em = orm.em.fork();
+
+      await em.transactional(async em1 => {
+        await em1.persistAndFlush(em1.create(TestEntity, { name: 'outer' }));
+
+        await em1.transactional(async em2 => {
+          await em2.persistAndFlush(em2.create(TestEntity, { name: 'inner' }));
+        }, { propagation: TransactionPropagation.REQUIRED });
+      });
+
+      // Verify only one BEGIN and one COMMIT
+      const beginCalls = mock.mock.calls.filter(c =>
+        c[0].toLowerCase().includes('begin'),
+      );
+      expect(beginCalls).toHaveLength(1);
+
+      const commitCalls = mock.mock.calls.filter(c =>
+        c[0].toLowerCase().includes('commit'),
+      );
+      expect(commitCalls).toHaveLength(1);
     });
 
     it('should rollback all operations when inner transaction fails', async () => {
@@ -231,6 +256,32 @@ describe('Transaction Propagation - SQLite', () => {
 
       const count = await orm.em.count(TestEntity);
       expect(count).toBe(1);
+    });
+
+    it('should create and use savepoints with query logging', async () => {
+      const mock = mockLogger(orm, ['query']);
+      const em = orm.em.fork();
+
+      await em.transactional(async em1 => {
+        await em1.persistAndFlush(em1.create(TestEntity, { name: 'outer' }));
+
+        await em1.transactional(async em2 => {
+          await em2.persistAndFlush(em2.create(TestEntity, { name: 'nested' }));
+        }, { propagation: TransactionPropagation.NESTED });
+      });
+
+      // Verify savepoint creation
+      const savepointCalls = mock.mock.calls.filter(c =>
+        c[0].toLowerCase().includes('savepoint'),
+      );
+      expect(savepointCalls.length).toBeGreaterThan(0);
+
+      // Check savepoint naming pattern
+      const savepointCreate = savepointCalls.find(c =>
+        !c[0].toLowerCase().includes('release') && !c[0].toLowerCase().includes('rollback'),
+      );
+      expect(savepointCreate).toBeDefined();
+      expect(savepointCreate![0]).toMatch(/savepoint/i);
     });
 
     it('should handle multiple nested savepoints', async () => {

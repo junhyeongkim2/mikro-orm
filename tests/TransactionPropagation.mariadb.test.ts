@@ -1,4 +1,5 @@
 import { Entity, MikroORM, PrimaryKey, Property, TransactionPropagation, IsolationLevel, FlushMode } from '@mikro-orm/mariadb';
+import { mockLogger } from './bootstrap';
 
 @Entity()
 class TestEntity {
@@ -54,6 +55,51 @@ describe('Transaction Propagation - MariaDB', () => {
 
       const count = await orm.em.count(TestEntity);
       expect(count).toBe(1);
+    });
+
+    it('should create new transaction if none exists', async () => {
+      const em = orm.em.fork();
+      let trx: any;
+
+      await em.transactional(async em1 => {
+        trx = (em1 as any).transactionContext;
+        const entity = em1.create(TestEntity, { name: 'test-new' });
+        await em1.persistAndFlush(entity);
+      }, { propagation: TransactionPropagation.REQUIRED });
+
+      expect(trx).toBeDefined();
+      const count = await orm.em.count(TestEntity);
+      expect(count).toBe(1);
+    });
+
+    it('should reuse same database connection and transaction with query logging', async () => {
+      const mock = mockLogger(orm, ['query']);
+      const em = orm.em.fork();
+
+      await em.transactional(async em1 => {
+        await em1.persistAndFlush(em1.create(TestEntity, { name: 'outer-log' }));
+
+        await em1.transactional(async em2 => {
+          await em2.persistAndFlush(em2.create(TestEntity, { name: 'inner-log' }));
+        }, { propagation: TransactionPropagation.REQUIRED });
+      });
+
+      // Verify only one BEGIN and one COMMIT
+      const beginCalls = mock.mock.calls.filter(c =>
+        c[0].toLowerCase().includes('begin') || c[0].toLowerCase().includes('start transaction'),
+      );
+      expect(beginCalls).toHaveLength(1);
+
+      const commitCalls = mock.mock.calls.filter(c =>
+        c[0].toLowerCase().includes('commit'),
+      );
+      expect(commitCalls).toHaveLength(1);
+
+      // No savepoints should be created for REQUIRED
+      const savepointCalls = mock.mock.calls.filter(c =>
+        c[0].toLowerCase().includes('savepoint'),
+      );
+      expect(savepointCalls).toHaveLength(0);
     });
   });
 

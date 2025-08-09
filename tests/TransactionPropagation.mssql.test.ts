@@ -1,4 +1,5 @@
 import { Entity, MikroORM, PrimaryKey, Property, TransactionPropagation, IsolationLevel, FlushMode } from '@mikro-orm/mssql';
+import { mockLogger } from './bootstrap';
 
 @Entity()
 class TestEntity {
@@ -55,6 +56,30 @@ describe('Transaction Propagation - MSSQL', () => {
       const count = await orm.em.count(TestEntity);
       expect(count).toBe(1);
     });
+
+    it('should reuse same database connection and transaction with query logging', async () => {
+      const mock = mockLogger(orm, ['query']);
+      const em = orm.em.fork();
+
+      await em.transactional(async em1 => {
+        await em1.persistAndFlush(em1.create(TestEntity, { name: 'outer' }));
+
+        await em1.transactional(async em2 => {
+          await em2.persistAndFlush(em2.create(TestEntity, { name: 'inner' }));
+        }, { propagation: TransactionPropagation.REQUIRED });
+      });
+
+      // Verify only one BEGIN and one COMMIT
+      const beginCalls = mock.mock.calls.filter(c =>
+        c[0].toLowerCase().includes('begin'),
+      );
+      expect(beginCalls).toHaveLength(1);
+
+      const commitCalls = mock.mock.calls.filter(c =>
+        c[0].toLowerCase().includes('commit'),
+      );
+      expect(commitCalls).toHaveLength(1);
+    });
   });
 
   describe('REQUIRES_NEW propagation', () => {
@@ -81,6 +106,32 @@ describe('Transaction Propagation - MSSQL', () => {
 
       const count = await orm.em.count(TestEntity);
       expect(count).toBe(2);
+    });
+
+    it('should use separate connections/transactions with query logging', async () => {
+      const mock = mockLogger(orm, ['query']);
+      const em = orm.em.fork();
+
+      await em.transactional(async em1 => {
+        await em1.persistAndFlush(em1.create(TestEntity, { name: 'outer-tx' }));
+
+        await em1.transactional(async em2 => {
+          await em2.persistAndFlush(em2.create(TestEntity, { name: 'inner-tx' }));
+        }, { propagation: TransactionPropagation.REQUIRES_NEW });
+
+        await em1.persistAndFlush(em1.create(TestEntity, { name: 'after-inner' }));
+      });
+
+      // Should have two separate BEGIN and COMMIT pairs
+      const beginCalls = mock.mock.calls.filter(c =>
+        c[0].toLowerCase().includes('begin'),
+      );
+      expect(beginCalls).toHaveLength(2);
+
+      const commitCalls = mock.mock.calls.filter(c =>
+        c[0].toLowerCase().includes('commit'),
+      );
+      expect(commitCalls).toHaveLength(2);
     });
   });
 
@@ -109,6 +160,26 @@ describe('Transaction Propagation - MSSQL', () => {
       const entities = await orm.em.find(TestEntity, {});
       expect(entities).toHaveLength(2);
       expect(entities.map(e => e.name)).toEqual(expect.arrayContaining(['outer', 'after']));
+    });
+
+    it('should create and use savepoints with query logging', async () => {
+      const mock = mockLogger(orm, ['query']);
+      const em = orm.em.fork();
+
+      await em.transactional(async em1 => {
+        await em1.persistAndFlush(em1.create(TestEntity, { name: 'outer' }));
+
+        await em1.transactional(async em2 => {
+          await em2.persistAndFlush(em2.create(TestEntity, { name: 'nested' }));
+        }, { propagation: TransactionPropagation.NESTED });
+      });
+
+      // Verify savepoint creation (MSSQL uses SAVE TRANSACTION)
+      const savepointCalls = mock.mock.calls.filter(c =>
+        c[0].toLowerCase().includes('save transaction') ||
+        c[0].toLowerCase().includes('savepoint'),
+      );
+      expect(savepointCalls.length).toBeGreaterThan(0);
     });
   });
 

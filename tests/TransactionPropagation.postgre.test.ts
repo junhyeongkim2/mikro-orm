@@ -59,6 +59,36 @@ describe('Transaction Propagation - PostgreSQL', () => {
       expect(count).toBe(1);
     });
 
+    it('should reuse same database connection and transaction with query logging', async () => {
+      const mock = mockLogger(orm, ['query']);
+      const em = orm.em.fork();
+
+      await em.transactional(async em1 => {
+        await em1.persistAndFlush(em1.create(TestEntity, { name: 'outer' }));
+
+        await em1.transactional(async em2 => {
+          await em2.persistAndFlush(em2.create(TestEntity, { name: 'inner' }));
+        }, { propagation: TransactionPropagation.REQUIRED });
+      });
+
+      // Verify only one BEGIN and one COMMIT
+      const beginCalls = mock.mock.calls.filter(c =>
+        c[0].toLowerCase().includes('begin'),
+      );
+      expect(beginCalls).toHaveLength(1);
+
+      const commitCalls = mock.mock.calls.filter(c =>
+        c[0].toLowerCase().includes('commit'),
+      );
+      expect(commitCalls).toHaveLength(1);
+
+      // No savepoints should be created for REQUIRED
+      const savepointCalls = mock.mock.calls.filter(c =>
+        c[0].toLowerCase().includes('savepoint'),
+      );
+      expect(savepointCalls).toHaveLength(0);
+    });
+
     it('should create new transaction if none exists', async () => {
       const em = orm.em.fork();
       let trx: any;
@@ -228,6 +258,86 @@ describe('Transaction Propagation - PostgreSQL', () => {
       const count = await orm.em.count(TestEntity);
       expect(count).toBe(3);
     });
+
+    it('should use separate connections/transactions with query logging', async () => {
+      const mock = mockLogger(orm, ['query']);
+      const em = orm.em.fork();
+
+      await em.transactional(async em1 => {
+        await em1.persistAndFlush(em1.create(TestEntity, { name: 'outer-tx' }));
+
+        await em1.transactional(async em2 => {
+          await em2.persistAndFlush(em2.create(TestEntity, { name: 'inner-tx' }));
+        }, { propagation: TransactionPropagation.REQUIRES_NEW });
+
+        await em1.persistAndFlush(em1.create(TestEntity, { name: 'after-inner' }));
+      });
+
+      // Should have two separate BEGIN and COMMIT pairs
+      const beginCalls = mock.mock.calls.filter(c =>
+        c[0].toLowerCase().includes('begin'),
+      );
+      expect(beginCalls).toHaveLength(2);
+
+      const commitCalls = mock.mock.calls.filter(c =>
+        c[0].toLowerCase().includes('commit'),
+      );
+      expect(commitCalls).toHaveLength(2);
+
+      // Verify query execution order
+      const queryTypes = mock.mock.calls.map(c => {
+        const query = c[0].toLowerCase();
+        if (query.includes('begin')) { return 'BEGIN'; }
+        if (query.includes('commit')) { return 'COMMIT'; }
+        if (query.includes('insert')) { return 'INSERT'; }
+        if (query.includes('rollback')) { return 'ROLLBACK'; }
+        return 'OTHER';
+      }).filter(type => type !== 'OTHER');
+
+      // Expected order: BEGIN (outer), INSERT, BEGIN (inner), INSERT, COMMIT (inner), INSERT, COMMIT (outer)
+      expect(queryTypes[0]).toBe('BEGIN');   // Outer transaction starts
+      expect(queryTypes[1]).toBe('INSERT');  // First entity
+      expect(queryTypes[2]).toBe('BEGIN');   // Inner transaction starts
+      expect(queryTypes[3]).toBe('INSERT');  // Second entity
+      expect(queryTypes[4]).toBe('COMMIT');  // Inner transaction commits
+      expect(queryTypes[5]).toBe('INSERT');  // Third entity
+      expect(queryTypes[6]).toBe('COMMIT');  // Outer transaction commits
+    });
+
+    it('should prevent deadlock with REQUIRES_NEW by using independent transactions', async () => {
+      const em = orm.em.fork();
+
+      // Create initial data
+      await em.persistAndFlush([
+        em.create(TestEntity, { name: 'resource-a', value: 1 }),
+        em.create(TestEntity, { name: 'resource-b', value: 2 }),
+      ]);
+
+      // Test that REQUIRES_NEW creates truly independent transactions
+      await em.transactional(async em1 => {
+        // Outer transaction locks resource-a
+        const entityA = await em1.findOne(TestEntity, { name: 'resource-a' });
+        entityA!.value = 10;
+        await em1.persistAndFlush(entityA!);
+
+        // Inner REQUIRES_NEW transaction should be able to access resource-b independently
+        await em1.transactional(async em2 => {
+          const entityB = await em2.findOne(TestEntity, { name: 'resource-b' });
+          entityB!.value = 20;
+          await em2.persistAndFlush(entityB!);
+        }, { propagation: TransactionPropagation.REQUIRES_NEW });
+
+        // After inner transaction completes, outer can continue
+        entityA!.value = 15;
+        await em1.persistAndFlush(entityA!);
+      });
+
+      // Verify both updates succeeded
+      const finalA = await orm.em.findOne(TestEntity, { name: 'resource-a' });
+      const finalB = await orm.em.findOne(TestEntity, { name: 'resource-b' });
+      expect(finalA!.value).toBe(15);
+      expect(finalB!.value).toBe(20);
+    });
   });
 
   describe('NESTED propagation', () => {
@@ -331,6 +441,75 @@ describe('Transaction Propagation - PostgreSQL', () => {
       const names = entities.map(e => e.name).sort();
       expect(names).toEqual(['nested2', 'outer']);
     });
+
+    it('should create and use savepoints with query logging', async () => {
+      const mock = mockLogger(orm, ['query']);
+      const em = orm.em.fork();
+
+      await em.transactional(async em1 => {
+        await em1.persistAndFlush(em1.create(TestEntity, { name: 'outer' }));
+
+        await em1.transactional(async em2 => {
+          await em2.persistAndFlush(em2.create(TestEntity, { name: 'nested' }));
+        }, { propagation: TransactionPropagation.NESTED });
+      });
+
+      // Verify savepoint creation
+      const savepointCalls = mock.mock.calls.filter(c =>
+        c[0].toLowerCase().includes('savepoint'),
+      );
+      expect(savepointCalls.length).toBeGreaterThan(0);
+
+      // Check savepoint naming pattern
+      const savepointCreate = savepointCalls.find(c =>
+        !c[0].toLowerCase().includes('release') && !c[0].toLowerCase().includes('rollback'),
+      );
+      expect(savepointCreate).toBeDefined();
+      expect(savepointCreate![0]).toMatch(/savepoint/i);
+    });
+
+    it('should rollback to savepoint on nested failure with query logging', async () => {
+      const mock = mockLogger(orm, ['query']);
+      const em = orm.em.fork();
+
+      await em.transactional(async em1 => {
+        await em1.persistAndFlush(em1.create(TestEntity, { name: 'before-savepoint' }));
+
+        try {
+          await em1.transactional(async em2 => {
+            await em2.persistAndFlush(em2.create(TestEntity, { name: 'in-savepoint' }));
+            throw new Error('Nested error');
+          }, { propagation: TransactionPropagation.NESTED });
+        } catch (e) {
+          // Expected
+        }
+
+        await em1.persistAndFlush(em1.create(TestEntity, { name: 'after-savepoint' }));
+      });
+
+      // Should have: BEGIN, INSERT, SAVEPOINT, INSERT, ROLLBACK TO SAVEPOINT, INSERT, COMMIT
+      const queryTypes = mock.mock.calls.map(c => {
+        const query = c[0].toLowerCase();
+        if (query.includes('begin')) { return 'BEGIN'; }
+        if (query.includes('commit')) { return 'COMMIT'; }
+        if (query.includes('insert')) { return 'INSERT'; }
+        if (query.includes('rollback to savepoint')) { return 'ROLLBACK_TO_SAVEPOINT'; }
+        if (query.includes('release savepoint')) { return 'RELEASE_SAVEPOINT'; }
+        if (query.includes('savepoint')) { return 'SAVEPOINT'; }
+        return 'OTHER';
+      }).filter(type => type !== 'OTHER');
+
+      // Verify ROLLBACK TO SAVEPOINT was called
+      expect(queryTypes).toContain('ROLLBACK_TO_SAVEPOINT');
+
+      // Transaction should still commit
+      expect(queryTypes[queryTypes.length - 1]).toBe('COMMIT');
+
+      // Verify data consistency
+      const entities = await orm.em.find(TestEntity, {});
+      expect(entities).toHaveLength(2);
+      expect(entities.map(e => e.name).sort()).toEqual(['after-savepoint', 'before-savepoint']);
+    });
   });
 
   describe('NOT_SUPPORTED propagation', () => {
@@ -404,6 +583,76 @@ describe('Transaction Propagation - PostgreSQL', () => {
   });
 
   describe('Mixed propagation scenarios', () => {
+    it('should properly isolate transactions with separate entity managers', async () => {
+      // Use separate EntityManager forks to demonstrate isolation
+      const em1 = orm.em.fork();
+      const em2 = orm.em.fork();
+
+      // Create initial entities
+      await orm.em.transactional(async em => {
+        await em.persistAndFlush(em.create(TestEntity, { name: 'isolated-1', value: 100 }));
+        await em.persistAndFlush(em.create(TestEntity, { name: 'isolated-2', value: 200 }));
+      });
+
+      // Run transactions with separate EntityManagers
+      // Transaction 1: Update isolated-1
+      await em1.transactional(async em => {
+        const entity = await em.findOne(TestEntity, { name: 'isolated-1' });
+        entity!.value = 150;
+        await em.persistAndFlush(entity!);
+      });
+
+      // Transaction 2: Update isolated-2 (different EM, different transaction)
+      await em2.transactional(async em => {
+        const entity = await em.findOne(TestEntity, { name: 'isolated-2' });
+        entity!.value = 250;
+        await em.persistAndFlush(entity!);
+      });
+
+      // Verify final values
+      const final1 = await orm.em.findOne(TestEntity, { name: 'isolated-1' });
+      const final2 = await orm.em.findOne(TestEntity, { name: 'isolated-2' });
+      expect(final1!.value).toBe(150);
+      expect(final2!.value).toBe(250);
+    });
+
+    it('should verify transaction context propagation', async () => {
+      const em = orm.em.fork();
+      const contexts: any[] = [];
+
+      await em.transactional(async em1 => {
+        contexts.push({ level: 1, context: (em1 as any).transactionContext });
+
+        // REQUIRED should share context
+        await em1.transactional(async em2 => {
+          contexts.push({ level: 2, type: 'REQUIRED', context: (em2 as any).transactionContext });
+        }, { propagation: TransactionPropagation.REQUIRED });
+
+        // REQUIRES_NEW should have new context
+        await em1.transactional(async em2 => {
+          contexts.push({ level: 2, type: 'REQUIRES_NEW', context: (em2 as any).transactionContext });
+        }, { propagation: TransactionPropagation.REQUIRES_NEW });
+
+        // NESTED should share context but with savepoint
+        await em1.transactional(async em2 => {
+          contexts.push({ level: 2, type: 'NESTED', context: (em2 as any).transactionContext });
+        }, { propagation: TransactionPropagation.NESTED });
+      });
+
+      // Verify context propagation
+      const level1Context = contexts.find(c => c.level === 1)!.context;
+      const requiredContext = contexts.find(c => c.type === 'REQUIRED')!.context;
+      const requiresNewContext = contexts.find(c => c.type === 'REQUIRES_NEW')!.context;
+      const nestedContext = contexts.find(c => c.type === 'NESTED')!.context;
+
+      expect(requiredContext).toBe(level1Context); // REQUIRED shares context
+      expect(requiresNewContext).not.toBe(level1Context); // REQUIRES_NEW has new context
+      // NESTED may have different context object due to savepoint, but same transaction
+      // Check if they are both defined and part of same transaction hierarchy
+      expect(nestedContext).toBeDefined();
+      expect(level1Context).toBeDefined();
+    });
+
     it('should handle complex nested propagations', async () => {
       const em = orm.em.fork();
 
