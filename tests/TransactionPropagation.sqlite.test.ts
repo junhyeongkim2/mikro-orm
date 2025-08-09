@@ -1,4 +1,4 @@
-import { Entity, MikroORM, PrimaryKey, Property, TransactionPropagation } from '@mikro-orm/sqlite';
+import { Entity, MikroORM, PrimaryKey, Property, TransactionPropagation, FlushMode } from '@mikro-orm/sqlite';
 
 @Entity()
 class TestEntity {
@@ -6,8 +6,11 @@ class TestEntity {
   @PrimaryKey()
   id!: number;
 
-  @Property()
+  @Property({ unique: true })
   name!: string;
+
+  @Property({ nullable: true })
+  value?: number;
 
 }
 
@@ -585,6 +588,130 @@ describe('Transaction Propagation - SQLite', () => {
 
       const count = await orm.em.count(TestEntity);
       expect(count).toBe(0);
+    });
+  });
+
+  describe('Advanced Features', () => {
+    describe('Flush Modes', () => {
+      it('should respect flush mode settings', async () => {
+        const em = orm.em.fork();
+
+        await em.transactional(async em1 => {
+          const entity = em1.create(TestEntity, { name: 'test-flush-sqlite' });
+          em1.persist(entity);
+
+          await em1.transactional(async () => {
+            entity.name = 'changed-sqlite';
+          }, {
+            propagation: TransactionPropagation.NESTED,
+            flushMode: FlushMode.COMMIT,
+          });
+
+          await em1.flush();
+        });
+
+        const entities = await orm.em.find(TestEntity, {});
+        expect(entities[0].name).toBe('changed-sqlite');
+      });
+
+      it('should handle different flush modes in nested transactions', async () => {
+        const em = orm.em.fork();
+
+        await em.transactional(async em1 => {
+          const entity = em1.create(TestEntity, { name: 'outer-flush-sqlite' });
+          em1.persist(entity);
+
+          await em1.transactional(async em2 => {
+            const entity2 = em2.create(TestEntity, { name: 'inner-flush-sqlite' });
+            await em2.persistAndFlush(entity2);
+          }, {
+            propagation: TransactionPropagation.NESTED,
+            flushMode: FlushMode.AUTO,
+          });
+        }, {
+          flushMode: FlushMode.COMMIT,
+        });
+
+        const count = await orm.em.count(TestEntity);
+        expect(count).toBe(2);
+      });
+    });
+
+    describe('Concurrent Operations', () => {
+      it('should handle sequential operations with NESTED (SQLite limitation)', async () => {
+        const em = orm.em.fork();
+
+        await em.transactional(async em1 => {
+          await em1.persistAndFlush(em1.create(TestEntity, { name: 'main-sqlite' }));
+
+          // SQLite uses savepoints for NESTED behavior
+          for (let i = 0; i < 3; i++) {
+            await em1.transactional(async em2 => {
+              const entity = em2.create(TestEntity, { name: `sequential-sqlite-${i}` });
+              await em2.persistAndFlush(entity);
+            }, { propagation: TransactionPropagation.NESTED });
+          }
+        });
+
+        const count = await orm.em.count(TestEntity);
+        expect(count).toBe(4);
+      });
+
+      it('should handle errors with savepoints', async () => {
+        const em = orm.em.fork();
+
+        await em.transactional(async em1 => {
+          await em1.persistAndFlush(em1.create(TestEntity, { name: 'outer-before-sqlite' }));
+
+          try {
+            await em1.transactional(async em2 => {
+              await em2.persistAndFlush(em2.create(TestEntity, { name: 'inner-fail-sqlite' }));
+              throw new Error('Savepoint error');
+            }, { propagation: TransactionPropagation.NESTED });
+          } catch (e) {
+            // Savepoint rolled back
+          }
+
+          await em1.persistAndFlush(em1.create(TestEntity, { name: 'outer-after-sqlite' }));
+        });
+
+        const entities = await orm.em.find(TestEntity, {});
+        expect(entities.map(e => e.name).sort()).toEqual(['outer-after-sqlite', 'outer-before-sqlite']);
+      });
+    });
+
+    describe('Clear Option with Propagation', () => {
+      it('should clear identity map when specified', async () => {
+        const em = orm.em.fork();
+        const entity = em.create(TestEntity, { name: 'test-clear-sqlite' });
+        await em.persistAndFlush(entity);
+
+        await em.transactional(async em1 => {
+          const loaded = await em1.findOne(TestEntity, { name: 'test-clear-sqlite' });
+          expect(loaded).toBeDefined();
+          expect(loaded).not.toBe(entity);
+        }, {
+          clear: true,
+        });
+      });
+    });
+
+    describe('Combined Options', () => {
+      it('should combine multiple options correctly', async () => {
+        const em = orm.em.fork();
+
+        await em.transactional(async em1 => {
+          const entity = em1.create(TestEntity, { name: 'combined-sqlite' });
+          await em1.persistAndFlush(entity);
+        }, {
+          propagation: TransactionPropagation.NESTED,
+          flushMode: FlushMode.AUTO,
+          clear: true,
+        });
+
+        const count = await orm.em.count(TestEntity);
+        expect(count).toBe(1);
+      });
     });
   });
 });

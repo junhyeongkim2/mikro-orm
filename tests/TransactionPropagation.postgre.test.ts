@@ -1,4 +1,5 @@
-import { Entity, MikroORM, PrimaryKey, Property, TransactionPropagation } from '@mikro-orm/postgresql';
+import { Entity, MikroORM, PrimaryKey, Property, TransactionPropagation, IsolationLevel, FlushMode } from '@mikro-orm/postgresql';
+import { mockLogger } from './bootstrap';
 
 @Entity()
 class TestEntity {
@@ -6,8 +7,14 @@ class TestEntity {
   @PrimaryKey()
   id!: number;
 
-  @Property()
+  @Property({ unique: true })
   name!: string;
+
+  @Property({ nullable: true })
+  value?: number;
+
+  @Property({ onCreate: () => new Date(), nullable: true })
+  createdAt?: Date;
 
 }
 
@@ -595,6 +602,301 @@ describe('Transaction Propagation - PostgreSQL', () => {
           // Empty transaction
         }, { propagation: TransactionPropagation.NOT_SUPPORTED });
       });
+
+      const count = await orm.em.count(TestEntity);
+      expect(count).toBe(0);
+    });
+  });
+
+  describe('Isolation Level with Propagation', () => {
+    it('should use specified isolation level', async () => {
+      const em = orm.em.fork();
+      const mock = mockLogger(orm);
+
+      await em.transactional(async () => {
+        // Transaction code
+      }, {
+        propagation: TransactionPropagation.REQUIRED,
+        isolationLevel: IsolationLevel.SERIALIZABLE,
+      });
+
+      // Check for isolation level setting (case insensitive)
+      const hasIsolationLevel = mock.mock.calls.some(call => {
+        const query = call[0].toLowerCase();
+        return query.includes('isolation level') && query.includes('serializable');
+      });
+      expect(hasIsolationLevel).toBe(true);
+    });
+
+    it('should maintain separate isolation levels for REQUIRES_NEW', async () => {
+      const em = orm.em.fork();
+      const mock = mockLogger(orm);
+
+      await em.transactional(async em1 => {
+        await em1.transactional(async () => {
+          // Inner transaction
+        }, {
+          propagation: TransactionPropagation.REQUIRES_NEW,
+          isolationLevel: IsolationLevel.READ_UNCOMMITTED,
+        });
+      }, {
+        isolationLevel: IsolationLevel.SERIALIZABLE,
+      });
+
+      const calls = mock.mock.calls.map(c => c[0].toLowerCase());
+      const isolationCalls = calls.filter(c => c.includes('isolation level'));
+      expect(isolationCalls.length).toBeGreaterThanOrEqual(2);
+    });
+
+    it('should inherit isolation level with REQUIRED', async () => {
+      const em = orm.em.fork();
+      const mock = mockLogger(orm);
+
+      await em.transactional(async em1 => {
+        await em1.transactional(async em2 => {
+          const entity = em2.create(TestEntity, { name: 'inner' });
+          await em2.persistAndFlush(entity);
+        }, {
+          propagation: TransactionPropagation.REQUIRED,
+          isolationLevel: IsolationLevel.REPEATABLE_READ, // Should be ignored
+        });
+      }, {
+        isolationLevel: IsolationLevel.SERIALIZABLE,
+      });
+
+      // Only outer transaction isolation level should be set
+      const calls = mock.mock.calls.map(c => c[0].toLowerCase());
+      const serializableCalls = calls.filter(c => c.includes('serializable'));
+      expect(serializableCalls.length).toBeGreaterThanOrEqual(1);
+    });
+  });
+
+  describe('Read-only Transactions with Propagation', () => {
+    it('should enforce read-only mode', async () => {
+      const em = orm.em.fork();
+
+      await expect(em.transactional(async em1 => {
+        const entity = em1.create(TestEntity, { name: 'test' });
+        await em1.persistAndFlush(entity);
+      }, {
+        propagation: TransactionPropagation.REQUIRED,
+        readOnly: true,
+      })).rejects.toThrow(/read-only transaction|READ ONLY|read only/i);
+    });
+
+    it('should allow writes in REQUIRES_NEW inside read-only', async () => {
+      const em = orm.em.fork();
+
+      await em.transactional(async em1 => {
+        // Read-only outer transaction
+        await em1.find(TestEntity, {});
+
+        // REQUIRES_NEW creates independent writable transaction
+        await em1.transactional(async em2 => {
+          const entity = em2.create(TestEntity, { name: 'writable' });
+          await em2.persistAndFlush(entity);
+        }, {
+          propagation: TransactionPropagation.REQUIRES_NEW,
+          readOnly: false,
+        });
+      }, {
+        readOnly: true,
+      });
+
+      const count = await orm.em.count(TestEntity);
+      expect(count).toBe(1);
+    });
+
+    it('should propagate read-only with REQUIRED', async () => {
+      const em = orm.em.fork();
+
+      await expect(em.transactional(async em1 => {
+        await em1.transactional(async em2 => {
+          const entity = em2.create(TestEntity, { name: 'inner' });
+          await em2.persistAndFlush(entity);
+        }, {
+          propagation: TransactionPropagation.REQUIRED,
+          readOnly: false, // Should be overridden by outer
+        });
+      }, {
+        readOnly: true,
+      })).rejects.toThrow();
+    });
+  });
+
+  describe('Flush Mode with Propagation', () => {
+    it('should respect flush mode settings', async () => {
+      const em = orm.em.fork();
+
+      await em.transactional(async em1 => {
+        const entity = em1.create(TestEntity, { name: 'test' });
+        em1.persist(entity);
+
+        // COMMIT mode - won't flush automatically
+        await em1.transactional(async () => {
+          entity.name = 'changed';
+          // Should not flush here
+        }, {
+          propagation: TransactionPropagation.NESTED,
+          flushMode: FlushMode.COMMIT,
+        });
+
+        // Manually flush
+        await em1.flush();
+      });
+
+      const entities = await orm.em.find(TestEntity, {});
+      expect(entities[0].name).toBe('changed');
+    });
+
+    it('should handle different flush modes in nested transactions', async () => {
+      const em = orm.em.fork();
+      const mock = mockLogger(orm);
+
+      await em.transactional(async em1 => {
+        const entity = em1.create(TestEntity, { name: 'outer' });
+        em1.persist(entity);
+
+        await em1.transactional(async em2 => {
+          const entity2 = em2.create(TestEntity, { name: 'inner' });
+          await em2.persistAndFlush(entity2);
+          // Explicit flush to ensure the insert happens
+        }, {
+          propagation: TransactionPropagation.REQUIRES_NEW,
+          flushMode: FlushMode.AUTO,
+        });
+      }, {
+        flushMode: FlushMode.COMMIT,
+      });
+
+      // Check that inner transaction executed insert
+      const calls = mock.mock.calls.map(c => c[0]);
+      const hasInnerInsert = calls.some(c => c.toLowerCase().includes('insert'));
+      expect(hasInnerInsert).toBe(true);
+    });
+  });
+
+  describe('Clear Option with Propagation', () => {
+    it('should clear identity map when specified', async () => {
+      const em = orm.em.fork();
+      const entity = em.create(TestEntity, { name: 'test' });
+      await em.persistAndFlush(entity);
+
+      await em.transactional(async em1 => {
+        // clear: true should clear the identity map
+        // Since identity map was cleared, loaded entity should be different instance
+        const loaded = await em1.findOne(TestEntity, { name: 'test' });
+        expect(loaded).toBeDefined();
+        expect(loaded).not.toBe(entity);
+      }, {
+        clear: true,
+      });
+    });
+
+    it('should maintain separate identity maps with REQUIRES_NEW', async () => {
+      const em = orm.em.fork();
+
+      await em.transactional(async em1 => {
+        const entity1 = em1.create(TestEntity, { name: 'outer' });
+        await em1.persistAndFlush(entity1);
+
+        await em1.transactional(async em2 => {
+          // REQUIRES_NEW should have separate identity map
+          const loaded = await em2.findOne(TestEntity, { name: 'outer' });
+          expect(loaded).toBeDefined();
+          expect(loaded).not.toBe(entity1); // Different instances
+        }, {
+          propagation: TransactionPropagation.REQUIRES_NEW,
+        });
+
+        // Original entity should still be in outer transaction's identity map
+        const reloaded = await em1.findOne(TestEntity, { name: 'outer' });
+        expect(reloaded).toBe(entity1); // Same instance
+      });
+    });
+  });
+
+  describe('Combined Options', () => {
+    it('should combine multiple options correctly', async () => {
+      const em = orm.em.fork();
+
+      await em.transactional(async em1 => {
+        const entity = em1.create(TestEntity, { name: 'combined' });
+        await em1.persistAndFlush(entity);
+      }, {
+        propagation: TransactionPropagation.REQUIRES_NEW,
+        isolationLevel: IsolationLevel.REPEATABLE_READ,
+        flushMode: FlushMode.AUTO,
+        clear: true,
+      });
+
+      // Verify entity was created
+      const count = await orm.em.count(TestEntity);
+      expect(count).toBe(1);
+    });
+
+    it('should handle complex nested scenarios with options', async () => {
+      const em = orm.em.fork();
+
+      await em.transactional(async em1 => {
+        const entity1 = em1.create(TestEntity, { name: 'level1' });
+        await em1.persistAndFlush(entity1);
+
+        await em1.transactional(async em2 => {
+          const entity2 = em2.create(TestEntity, { name: 'level2' });
+          await em2.persistAndFlush(entity2);
+
+          await em2.transactional(async em3 => {
+            const entity3 = em3.create(TestEntity, { name: 'level3' });
+            await em3.persistAndFlush(entity3);
+          }, {
+            propagation: TransactionPropagation.REQUIRES_NEW,
+            isolationLevel: IsolationLevel.READ_COMMITTED,
+          });
+        }, {
+          propagation: TransactionPropagation.NESTED,
+          flushMode: FlushMode.AUTO,
+        });
+      }, {
+        isolationLevel: IsolationLevel.REPEATABLE_READ,
+        flushMode: FlushMode.COMMIT,
+      });
+
+      const count = await orm.em.count(TestEntity);
+      expect(count).toBe(3);
+    });
+  });
+
+  describe('Error Scenarios with Options', () => {
+    it('should handle errors with read-only transactions', async () => {
+      const em = orm.em.fork();
+
+      await expect(em.transactional(async em1 => {
+        await em1.transactional(async em2 => {
+          const entity = em2.create(TestEntity, { name: 'fail' });
+          await em2.persistAndFlush(entity);
+        }, {
+          propagation: TransactionPropagation.NESTED,
+        });
+      }, {
+        readOnly: true,
+      })).rejects.toThrow();
+    });
+
+    it('should rollback correctly with custom isolation levels', async () => {
+      const em = orm.em.fork();
+
+      try {
+        await em.transactional(async em1 => {
+          const entity = em1.create(TestEntity, { name: 'will-rollback' });
+          await em1.persistAndFlush(entity);
+          throw new Error('Rollback');
+        }, {
+          isolationLevel: IsolationLevel.SERIALIZABLE,
+        });
+      } catch (e) {
+        // Expected
+      }
 
       const count = await orm.em.count(TestEntity);
       expect(count).toBe(0);

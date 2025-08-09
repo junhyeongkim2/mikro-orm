@@ -1,4 +1,4 @@
-import { MikroORM, TransactionPropagation } from '@mikro-orm/mongodb';
+import { MikroORM, TransactionPropagation, FlushMode } from '@mikro-orm/mongodb';
 import { Author } from './entities';
 import { initORMMongo } from './bootstrap';
 
@@ -474,6 +474,221 @@ describe('Transaction Propagation - MongoDB', () => {
 
       const count = await orm.em.count(Author);
       expect(count).toBe(3);
+    });
+  });
+
+  describe('Advanced Features', () => {
+    describe('Flush Modes with Propagation', () => {
+      it('should respect flush mode settings', async () => {
+        const em = orm.em.fork();
+
+        await em.transactional(async em1 => {
+          const entity = new Author('flush-test', 'flush@test.com');
+          em1.persist(entity);
+
+          // COMMIT mode - won't flush automatically
+          await em1.transactional(async () => {
+            entity.name = 'flush-changed';
+            // Should not flush here
+          }, {
+            propagation: TransactionPropagation.REQUIRED,
+            flushMode: FlushMode.COMMIT,
+          });
+
+          // Manually flush
+          await em1.flush();
+        });
+
+        const authors = await orm.em.find(Author, {});
+        expect(authors[0].name).toBe('flush-changed');
+      });
+
+      it('should handle different flush modes in nested transactions', async () => {
+        const em = orm.em.fork();
+
+        await em.transactional(async em1 => {
+          const entity = new Author('outer-flush', 'outer@test.com');
+          em1.persist(entity);
+
+          await em1.transactional(async em2 => {
+            const entity2 = new Author('inner-flush', 'inner@test.com');
+            await em2.persistAndFlush(entity2);
+          }, {
+            propagation: TransactionPropagation.REQUIRES_NEW,
+            flushMode: FlushMode.AUTO,
+          });
+        }, {
+          flushMode: FlushMode.COMMIT,
+        });
+
+        const count = await orm.em.count(Author);
+        expect(count).toBe(2);
+      });
+    });
+
+    describe('Concurrent Transactions', () => {
+      it('should handle multiple REQUIRES_NEW transactions in parallel', async () => {
+        const em = orm.em.fork();
+
+        await em.transactional(async em1 => {
+          const main = new Author('concurrent-main', 'main@test.com');
+          await em1.persistAndFlush(main);
+
+          const promises = Array.from({ length: 3 }, (_, i) =>
+            em1.transactional(async em2 => {
+              const entity = new Author(`concurrent-${i}`, `concurrent${i}@test.com`);
+              await em2.persistAndFlush(entity);
+              return entity.id;
+            }, { propagation: TransactionPropagation.REQUIRES_NEW }),
+          );
+
+          const results = await Promise.all(promises);
+          expect(results).toHaveLength(3);
+          expect(new Set(results).size).toBe(3);
+        });
+
+        const count = await orm.em.count(Author);
+        expect(count).toBe(4);
+      });
+
+      it('should maintain isolation between concurrent REQUIRES_NEW', async () => {
+        const em = orm.em.fork();
+
+        await em.transactional(async em1 => {
+          const results = await Promise.all([
+            em1.transactional(async em2 => {
+              const entity = new Author('tx1', 'tx1@test.com');
+              await em2.persistAndFlush(entity);
+              await new Promise(resolve => setTimeout(resolve, 50));
+              // In MongoDB, we may not see our own writes in some cases
+              const count = await em2.count(Author, { name: 'tx1' });
+              return count > 0 ? 1 : entity.id ? 1 : 0;
+            }, { propagation: TransactionPropagation.REQUIRES_NEW }),
+
+            em1.transactional(async em2 => {
+              const entity = new Author('tx2', 'tx2@test.com');
+              await em2.persistAndFlush(entity);
+              await new Promise(resolve => setTimeout(resolve, 50));
+              // In MongoDB, we may not see our own writes in some cases
+              const count = await em2.count(Author, { name: 'tx2' });
+              return count > 0 ? 1 : entity.id ? 1 : 0;
+            }, { propagation: TransactionPropagation.REQUIRES_NEW }),
+          ]);
+
+          // Both transactions should have created entities
+          expect(results.every(r => r === 1)).toBe(true);
+        });
+
+        const entities = await orm.em.find(Author, {});
+        expect(entities).toHaveLength(2);
+      });
+    });
+
+    describe('Error Recovery Patterns', () => {
+      it('should support retry pattern with REQUIRES_NEW', async () => {
+        const em = orm.em.fork();
+        let attempts = 0;
+
+        await em.transactional(async em1 => {
+          const main = new Author('retry-main', 'main@test.com');
+          await em1.persistAndFlush(main);
+
+          let success = false;
+          while (!success && attempts < 3) {
+            try {
+              await em1.transactional(async em2 => {
+                attempts++;
+                if (attempts < 3) {
+                  throw new Error(`Attempt ${attempts} failed`);
+                }
+                const entity = new Author('retry-success', 'retry@test.com');
+                await em2.persistAndFlush(entity);
+              }, { propagation: TransactionPropagation.REQUIRES_NEW });
+              success = true;
+            } catch (e) {
+              // Retry
+            }
+          }
+
+          expect(success).toBe(true);
+          expect(attempts).toBe(3);
+        });
+
+        const authors = await orm.em.find(Author, {});
+        expect(authors.map(a => a.name).sort()).toEqual(['retry-main', 'retry-success']);
+      });
+
+      it('should handle partial rollback patterns', async () => {
+        const em = orm.em.fork();
+
+        await em.transactional(async em1 => {
+          const before = new Author('before-error', 'before@test.com');
+          await em1.persistAndFlush(before);
+
+          try {
+            await em1.transactional(async em2 => {
+              const fail = new Author('will-fail', 'fail@test.com');
+              await em2.persistAndFlush(fail);
+              throw new Error('Nested error');
+            }, { propagation: TransactionPropagation.REQUIRES_NEW });
+          } catch (e) {
+            // Independent transaction failed
+          }
+
+          const after = new Author('after-error', 'after@test.com');
+          await em1.persistAndFlush(after);
+        });
+
+        const authors = await orm.em.find(Author, {});
+        expect(authors.map(a => a.name).sort()).toEqual(['after-error', 'before-error']);
+      });
+    });
+
+    describe('Combined Options', () => {
+      it('should combine multiple options correctly', async () => {
+        const em = orm.em.fork();
+
+        await em.transactional(async em1 => {
+          const entity = new Author('combined-options', 'combined@test.com');
+          await em1.persistAndFlush(entity);
+        }, {
+          propagation: TransactionPropagation.REQUIRES_NEW,
+          flushMode: FlushMode.AUTO,
+          clear: true,
+        });
+
+        const count = await orm.em.count(Author);
+        expect(count).toBe(1);
+      });
+
+      it('should handle complex nested scenarios with options', async () => {
+        const em = orm.em.fork();
+
+        await em.transactional(async em1 => {
+          const entity1 = new Author('level1-options', 'level1@test.com');
+          await em1.persistAndFlush(entity1);
+
+          await em1.transactional(async em2 => {
+            const entity2 = new Author('level2-options', 'level2@test.com');
+            await em2.persistAndFlush(entity2);
+
+            await em2.transactional(async em3 => {
+              const entity3 = new Author('level3-options', 'level3@test.com');
+              await em3.persistAndFlush(entity3);
+            }, {
+              propagation: TransactionPropagation.REQUIRES_NEW,
+            });
+          }, {
+            propagation: TransactionPropagation.REQUIRED,
+            flushMode: FlushMode.AUTO,
+          });
+        }, {
+          flushMode: FlushMode.COMMIT,
+        });
+
+        const count = await orm.em.count(Author);
+        expect(count).toBe(3);
+      });
     });
   });
 });

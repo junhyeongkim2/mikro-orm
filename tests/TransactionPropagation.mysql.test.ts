@@ -1,4 +1,4 @@
-import { Entity, MikroORM, PrimaryKey, Property, TransactionPropagation } from '@mikro-orm/mysql';
+import { Entity, MikroORM, PrimaryKey, Property, TransactionPropagation, IsolationLevel, FlushMode } from '@mikro-orm/mysql';
 
 @Entity()
 class TestEntity {
@@ -6,8 +6,11 @@ class TestEntity {
   @PrimaryKey()
   id!: number;
 
-  @Property()
+  @Property({ unique: true })
   name!: string;
+
+  @Property({ nullable: true })
+  value?: number;
 
 }
 
@@ -150,12 +153,12 @@ describe('Transaction Propagation - MySQL', () => {
       const em = orm.em.fork();
 
       await em.transactional(async em1 => {
-        const entity1 = em1.create(TestEntity, { name: 'outer' });
+        const entity1 = em1.create(TestEntity, { name: 'isolate-outer' });
         await em1.persistAndFlush(entity1);
 
         try {
           await em1.transactional(async em2 => {
-            const entity2 = em2.create(TestEntity, { name: 'inner' });
+            const entity2 = em2.create(TestEntity, { name: 'isolate-inner' });
             await em2.persistAndFlush(entity2);
             throw new Error('Rollback inner');
           }, { propagation: TransactionPropagation.REQUIRES_NEW });
@@ -163,13 +166,13 @@ describe('Transaction Propagation - MySQL', () => {
           // Inner transaction rolled back
         }
 
-        const entity3 = em1.create(TestEntity, { name: 'after' });
+        const entity3 = em1.create(TestEntity, { name: 'isolate-after' });
         await em1.persistAndFlush(entity3);
       });
 
       const entities = await orm.em.find(TestEntity, {});
       expect(entities).toHaveLength(2);
-      expect(entities.map(e => e.name)).toEqual(expect.arrayContaining(['outer', 'after']));
+      expect(entities.map(e => e.name)).toEqual(expect.arrayContaining(['isolate-outer', 'isolate-after']));
     });
 
     it('should commit inner transaction even if outer fails', async () => {
@@ -599,6 +602,114 @@ describe('Transaction Propagation - MySQL', () => {
 
       const count = await orm.em.count(TestEntity);
       expect(count).toBe(0);
+    });
+  });
+
+  describe('Advanced Features', () => {
+    describe('Isolation Levels', () => {
+      it('should use specified isolation level', async () => {
+        const em = orm.em.fork();
+
+        await em.transactional(async em1 => {
+          const entity = em1.create(TestEntity, { name: 'isolated' });
+          await em1.persistAndFlush(entity);
+        }, {
+          propagation: TransactionPropagation.REQUIRED,
+          isolationLevel: IsolationLevel.SERIALIZABLE,
+        });
+
+        const count = await orm.em.count(TestEntity);
+        expect(count).toBe(1);
+      });
+
+      it('should maintain separate isolation levels for REQUIRES_NEW', async () => {
+        const em = orm.em.fork();
+
+        await em.transactional(async em1 => {
+          await em1.transactional(async em2 => {
+            const entity = em2.create(TestEntity, { name: 'inner-isolated' });
+            await em2.persistAndFlush(entity);
+          }, {
+            propagation: TransactionPropagation.REQUIRES_NEW,
+            isolationLevel: IsolationLevel.READ_UNCOMMITTED,
+          });
+        }, {
+          isolationLevel: IsolationLevel.SERIALIZABLE,
+        });
+
+        const count = await orm.em.count(TestEntity);
+        expect(count).toBe(1);
+      });
+    });
+
+    describe('Flush Modes', () => {
+      it('should respect flush mode settings', async () => {
+        const em = orm.em.fork();
+
+        await em.transactional(async em1 => {
+          const entity = em1.create(TestEntity, { name: 'test-flush' });
+          em1.persist(entity);
+
+          await em1.transactional(async () => {
+            entity.name = 'changed';
+          }, {
+            propagation: TransactionPropagation.NESTED,
+            flushMode: FlushMode.COMMIT,
+          });
+
+          await em1.flush();
+        });
+
+        const entities = await orm.em.find(TestEntity, {});
+        expect(entities[0].name).toBe('changed');
+      });
+    });
+
+    describe('Concurrent Transactions', () => {
+      it('should handle multiple REQUIRES_NEW transactions in parallel', async () => {
+        const em = orm.em.fork();
+
+        await em.transactional(async em1 => {
+          await em1.persistAndFlush(em1.create(TestEntity, { name: 'main' }));
+
+          const promises = Array.from({ length: 3 }, (_, i) =>
+            em1.transactional(async em2 => {
+              const entity = em2.create(TestEntity, { name: `parallel-${i}` });
+              await em2.persistAndFlush(entity);
+              return entity.id;
+            }, { propagation: TransactionPropagation.REQUIRES_NEW }),
+          );
+
+          const results = await Promise.all(promises);
+          expect(results).toHaveLength(3);
+          expect(new Set(results).size).toBe(3);
+        });
+
+        const count = await orm.em.count(TestEntity);
+        expect(count).toBe(4);
+      });
+
+      it('should isolate REQUIRES_NEW failure from outer transaction', async () => {
+        const em = orm.em.fork();
+
+        await em.transactional(async em1 => {
+          await em1.persistAndFlush(em1.create(TestEntity, { name: 'outer-before' }));
+
+          try {
+            await em1.transactional(async em2 => {
+              await em2.persistAndFlush(em2.create(TestEntity, { name: 'inner-fail' }));
+              throw new Error('Inner transaction failed');
+            }, { propagation: TransactionPropagation.REQUIRES_NEW });
+          } catch (e) {
+            // Inner transaction rolled back independently
+          }
+
+          await em1.persistAndFlush(em1.create(TestEntity, { name: 'outer-after' }));
+        });
+
+        const entities = await orm.em.find(TestEntity, {});
+        expect(entities.map(e => e.name).sort()).toEqual(['outer-after', 'outer-before']);
+      });
     });
   });
 });
