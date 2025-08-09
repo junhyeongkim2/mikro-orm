@@ -6,6 +6,7 @@ import { ExceptionConverter } from './ExceptionConverter';
 import type { EntityManager } from '../EntityManager';
 import type { Configuration } from '../utils/Configuration';
 import type { IDatabaseDriver } from '../drivers/IDatabaseDriver';
+import { type TransactionPropagation, ReferenceKind } from '../enums';
 import {
   ArrayType,
   BigIntType,
@@ -33,7 +34,6 @@ import {
   IntervalType,
 } from '../types';
 import { parseJsonSafe, Utils } from '../utils/Utils';
-import { ReferenceKind } from '../enums';
 import type { MikroORM } from '../MikroORM';
 import type { TransformContext } from '../types/Type';
 
@@ -52,6 +52,38 @@ export abstract class Platform {
 
   supportsTransactions(): boolean {
     return !this.config.get('disableTransactions');
+  }
+
+  /**
+   * Whether the platform supports creating independent transactions while another transaction is active.
+   * This is typically false for single-connection databases like SQLite in-memory mode.
+   */
+  supportsIndependentTransactions(): boolean {
+    return true;
+  }
+
+  /**
+   * Whether the platform supports savepoints for nested transactions.
+   * Most SQL databases support this, but MongoDB does not.
+   */
+  supportsSavepoints(): boolean {
+    return true;
+  }
+
+  /**
+   * Whether the platform supports nested transactions.
+   * This is different from savepoints - some platforms may have their own nested transaction mechanism.
+   */
+  supportsNestedTransactions(): boolean {
+    return this.supportsSavepoints();
+  }
+
+  /**
+   * Returns a fallback propagation type when the requested propagation is not supported.
+   * Returns null if no fallback is appropriate (should throw error).
+   */
+  getTransactionPropagationFallback(propagation: TransactionPropagation): TransactionPropagation | null {
+    return null;
   }
 
   usesImplicitTransactions(): boolean {

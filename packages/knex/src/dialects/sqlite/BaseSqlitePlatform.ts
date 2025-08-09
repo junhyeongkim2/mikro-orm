@@ -1,4 +1,4 @@
-import { type EntityProperty, type IsolationLevel, Utils } from '@mikro-orm/core';
+import { type EntityProperty, type IsolationLevel, Utils, TransactionPropagation } from '@mikro-orm/core';
 import { AbstractSqlPlatform } from '../../AbstractSqlPlatform';
 
 export abstract class BaseSqlitePlatform extends AbstractSqlPlatform {
@@ -9,6 +9,23 @@ export abstract class BaseSqlitePlatform extends AbstractSqlPlatform {
 
   override usesReturningStatement(): boolean {
     return true;
+  }
+
+  /**
+   * SQLite doesn't support multiple independent transactions on the same connection.
+   * In-memory databases (:memory:) use a single connection, making REQUIRES_NEW problematic.
+   */
+  override supportsIndependentTransactions(): boolean {
+    return false;
+  }
+
+  override getTransactionPropagationFallback(propagation: TransactionPropagation): TransactionPropagation | null {
+    // When REQUIRES_NEW is requested but we can't create independent transactions,
+    // fall back to NESTED (savepoint)
+    if (propagation === TransactionPropagation.REQUIRES_NEW) {
+      return TransactionPropagation.NESTED;
+    }
+    return null;
   }
 
   override getCurrentTimestampSQL(length: number): string {
