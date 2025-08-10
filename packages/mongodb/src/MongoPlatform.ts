@@ -75,6 +75,16 @@ export class MongoPlatform extends Platform {
     return false;
   }
 
+  override supportsSavepoints(): boolean {
+    // MongoDB doesn't support savepoints
+    return false;
+  }
+
+  override supportsNestedTransactions(): boolean {
+    // MongoDB doesn't support nested transactions
+    return false;
+  }
+
   override convertsJsonAutomatically(): boolean {
     return true;
   }
