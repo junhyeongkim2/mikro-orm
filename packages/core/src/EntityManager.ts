@@ -85,11 +85,12 @@ import {
 } from './enums';
 import type { MetadataStorage } from './metadata';
 import type { Transaction } from './connections';
-import { EventManager, type FlushEventArgs, TransactionEventBroadcaster } from './events';
+import { EventManager, TransactionEventBroadcaster } from './events';
 import type { EntityComparator } from './utils/EntityComparator';
 import { OptimisticLockError, ValidationError } from './errors';
 import type { CacheAdapter } from './cache/CacheAdapter';
 import { getLoadingStrategy } from './entity/utils';
+import { TransactionManager } from './utils/TransactionManager';
 
 /**
  * The EntityManager is the central access point to ORM functionality. It is a facade to all different ORM subsystems
@@ -445,7 +446,7 @@ export class EntityManager<Driver extends IDatabaseDriver = IDatabaseDriver> {
       for (const hint of (options.populate as unknown as PopulateOptions<Entity>[])) {
         const field = hint.field.split(':')[0] as EntityKey<Entity>;
         const prop = meta.properties[field];
-        const strategy = getLoadingStrategy(prop.strategy || options.strategy || hint.strategy || this.config.get('loadStrategy'), prop.kind);
+        const strategy = getLoadingStrategy(prop.strategy || hint.strategy || options.strategy || this.config.get('loadStrategy'), prop.kind);
         const joined = strategy === LoadStrategy.JOINED && prop.kind !== ReferenceKind.SCALAR;
 
         if (!joined && !hint.filter) {
@@ -491,10 +492,20 @@ export class EntityManager<Driver extends IDatabaseDriver = IDatabaseDriver> {
 
       if (!Utils.isEmpty(cond)) {
         const populated = (options.populate as PopulateOptions<T>[]).filter(({ field }) => field.split(':')[0] === prop.name);
+        let found = false;
 
         if (populated.length > 0) {
-          populated.forEach(hint => hint.filter = true);
-        } else {
+          for (const hint of populated) {
+            if (!hint.all) {
+              hint.filter = true;
+              found = true;
+            } else if (hint.field === `${prop.name}:ref`) {
+              found = true;
+            }
+          }
+        }
+
+        if (!found) {
           ret.push({ field: `${prop.name}:ref` as any, strategy: LoadStrategy.JOINED, filter: true });
         }
       }
@@ -1284,43 +1295,8 @@ export class EntityManager<Driver extends IDatabaseDriver = IDatabaseDriver> {
       return cb(em);
     }
 
-    const fork = em.fork({
-      clear: options.clear ?? false, // state will be merged once resolves
-      flushMode: options.flushMode,
-      cloneEventManager: true,
-      disableTransactions: options.ignoreNestedTransactions,
-      loggerContext: options.loggerContext,
-    });
-    options.ctx ??= em.transactionContext;
-    const propagateToUpperContext = !em.global || this.config.get('allowGlobalContext');
-
-    return TransactionContext.create(fork, async () => {
-      return fork.getConnection().transactional(async trx => {
-        fork.transactionContext = trx;
-
-        if (propagateToUpperContext) {
-          fork.eventManager.registerSubscriber({
-            afterFlush(args: FlushEventArgs) {
-              args.uow.getChangeSets()
-                .filter(cs => [ChangeSetType.DELETE, ChangeSetType.DELETE_EARLY].includes(cs.type))
-                .forEach(cs => em.unitOfWork.unsetIdentity(cs.entity));
-            },
-          });
-        }
-
-        const ret = await cb(fork);
-        await fork.flush();
-
-        if (propagateToUpperContext) {
-          // ensure all entities from inner context are merged to the upper one
-          for (const entity of fork.unitOfWork.getIdentityMap()) {
-            em.merge(entity, { disableContextResolution: true, keepIdentity: true, refresh: true });
-          }
-        }
-
-        return ret;
-      }, { ...options, eventBroadcaster: new TransactionEventBroadcaster(fork, undefined, { topLevelTransaction: !options.ctx }) });
-    });
+    const manager = new TransactionManager(this);
+    return manager.handle(cb as (em: EntityManager) => T | Promise<T>, options);
   }
 
   /**

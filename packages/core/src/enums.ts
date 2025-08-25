@@ -113,6 +113,7 @@ export enum QueryFlag {
   INCLUDE_LAZY_FORMULAS = 'INCLUDE_LAZY_FORMULAS',
   AUTO_JOIN_ONE_TO_ONE_OWNER = 'AUTO_JOIN_ONE_TO_ONE_OWNER',
   INFER_POPULATE = 'INFER_POPULATE',
+  DISABLE_NESTED_INNER_JOIN = 'DISABLE_NESTED_INNER_JOIN',
   IDENTITY_INSERT = 'IDENTITY_INSERT', // mssql only
 }
 
@@ -142,7 +143,6 @@ export enum Cascade {
 export enum LoadStrategy {
   SELECT_IN = 'select-in',
   JOINED = 'joined',
-  INNER_JOINED = 'inner-joined',
   BALANCED = 'balanced',
 }
 
@@ -201,8 +201,19 @@ export const EventTypeMap = Object.keys(EventType).reduce((a, b, i) => {
 
 export type TransactionEventType = EventType.beforeTransactionStart | EventType.afterTransactionStart | EventType.beforeTransactionCommit | EventType.afterTransactionCommit | EventType.beforeTransactionRollback | EventType.afterTransactionRollback;
 
+export enum TransactionPropagation {
+  REQUIRED = 'required',
+  REQUIRES_NEW = 'requires_new',
+  NESTED = 'nested',
+  NOT_SUPPORTED = 'not_supported',
+  SUPPORTS = 'supports',
+  MANDATORY = 'mandatory',
+  NEVER = 'never',
+}
+
 export interface TransactionOptions {
   ctx?: Transaction;
+  propagation?: TransactionPropagation;
   isolationLevel?: IsolationLevel;
   readOnly?: boolean;
   clear?: boolean;
